@@ -1,65 +1,71 @@
 // Shared-secret-per-process guard: one API key from PM_API_KEY protects the
 // publish path. This is NOT an HSM or per-client key story — rotation means
-// redeploying with a new env value.
+// redeploying with a new env value. `Provided` keys are compared to the
+// configured shared key in constant time; if PM_API_KEY is unset the publish
+// endpoint fails closed (503 publish_disabled).
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { Elysia } from 'elysia';
 
-const PUBLISH_PATH = '/api/v1/plugins/publish';
-
-// compare via SHA-256 digests so both buffers are always 32 bytes — no length
-// check, so no length leak; a short-circuit on unequal lengths would leak the
-// configured key's length anyway
-function keysEqual(provided: string, expected: string): boolean {
+// constant-time API key check. both sides are hashed first so the compare
+// runs on equal-length digests — no early exit on length mismatch, no
+// "how many leading bytes matched" signal leaking through timing
+function apiKeyMatches(provided: string, expected: string): boolean {
   const a = createHash('sha256').update(provided, 'utf8').digest();
   const b = createHash('sha256').update(expected, 'utf8').digest();
   return timingSafeEqual(a, b);
 }
 
-// one structured line per auth decision; key material is never included, only
-// its byte length — and never the configured key's length either
-function logAuthDecision(method: string, path: string, keyLen: number, ok: boolean) {
-  const line = JSON.stringify({
-    event: 'auth',
-    method,
-    path,
-    keyLen,
-    result: ok ? 'pass' : 'fail',
-  });
-  if (ok) {
-    console.log(line);
-  } else {
-    console.warn(line);
-  }
-}
+const publishPath = '/api/v1/plugins/publish';
+
+const unauthorized = () => ({
+  ok: false,
+  error: { code: 'unauthorized', message: 'a valid x-api-key header is required' },
+});
 
 /**
- * API-key guard for the publish path. If PM_API_KEY is unset the publish
- * endpoint rejects every request with the same 401 as a wrong key (no open
- * bypass) and a one-time warning is logged at startup; request-time behavior
- * is indistinguishable from a mismatch. dev-mode-only default, never a bypass.
- * Future test (deliberately not written yet): unset PM_API_KEY -> 401 for any
- * presented key + startup warn once; do not add permissive dev behavior instead.
+ * Minimal API-key auth for the publish path. If PM_API_KEY is unset the
+ * endpoint is disabled outright (503, fail closed) — an unauthenticated
+ * publish endpoint on a public registry is a supply-chain hole, not a dev
+ * convenience. Warning fires at startup either way so a missing key never
+ * goes unnoticed. Request-time behavior is identical for missing vs wrong
+ * key (constant-time compare where the configured key is weakly uniform).
  */
 export function authGuard(apiKey: string | undefined) {
-  const configured = apiKey && apiKey.length > 0 ? apiKey : undefined;
-  if (configured === undefined) {
+  if (!apiKey) {
+    console.error(
+      'PM_API_KEY is not set — publish endpoint is disabled (set PM_API_KEY to enable it)',
+    );
+    return new Elysia()
+      .onBeforeHandle(({ path, set }) => {
+        if (path === publishPath) {
+          set.status = 503;
+          return {
+            ok: false,
+            error: {
+              code: 'publish_disabled',
+              message:
+                'publishing is disabled: PM_API_KEY is not configured on the server',
+            },
+          };
+        }
+      })
+      .as('global');
+  }
+  if (apiKey.length < 16) {
     console.warn(
-      'PM_API_KEY is not set — publish endpoint will reject all requests with 401',
+      'PM_API_KEY is shorter than 16 characters — use a long random value in production',
     );
   }
-  // as: 'scoped' exports the hook to the parent app — plugin hooks default to
-  // local scope and would never run for the publish route registered there
-  return new Elysia().onBeforeHandle({ as: 'scoped' }, ({ path, request, set }) => {
-    if (path !== PUBLISH_PATH) return;
-    const provided = request.headers.get('x-api-key') ?? '';
-    // never digest-compare against a sentinel: empty provided vs unset env must
-    // fail closed explicitly, not by accidentally matching an empty secret
-    const ok = configured !== undefined && keysEqual(provided, configured);
-    logAuthDecision(request.method, path, Buffer.byteLength(provided, 'utf8'), ok);
-    if (!ok) {
-      set.status = 401;
-      // exactly this body, nothing else — no set-cookie, no hint about env state
-      return { ok: false, reason: 'unauthorized' };
-    }
-  });
+  return new Elysia()
+    .derive(({ request }) => {
+      const provided = request.headers.get('x-api-key') ?? '';
+      return { apiKeyMatches: apiKeyMatches(provided, apiKey) };
+    })
+    .onBeforeHandle(({ path, apiKeyMatches, set }) => {
+      if (path === publishPath && !apiKeyMatches) {
+        set.status = 401;
+        return unauthorized();
+      }
+    })
+    .as('global');
 }
