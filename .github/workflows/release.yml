@@ -1,0 +1,124 @@
+# cut a versioned release from a v* tag: compile the packetmanager binary
+# with bun --compile for linux/darwin/windows, verify tests + types at the
+# same time, then attach the binaries to a github release.
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# default to read-only, the release job re-grants write below
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  BUN_VERSION: 1.4.2 # pinned on purpose — reproducible builds; bump deliberately
+
+jobs:
+  test:
+    name: Test & typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: bun test
+        run: bun test
+
+      - name: tsc --noEmit
+        run: bunx tsc --noEmit
+
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: bun-linux-x64, name: linux-x64, ext: '' }
+          - { target: bun-darwin-x64, name: darwin-x64, ext: '' }
+          - { target: bun-darwin-arm64, name: darwin-arm64, ext: '' }
+          - { target: bun-windows-x64, name: windows-x64, ext: '.exe' }
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Compile binary
+        env:
+          MATRIX_TARGET: ${{ matrix.target }}
+          MATRIX_NAME: ${{ matrix.name }}
+          MATRIX_EXT: ${{ matrix.ext }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          bun build --compile --minify src/index.ts \
+            --target="$MATRIX_TARGET" \
+            --outfile "dist/packetmanager-${version}-${MATRIX_NAME}${MATRIX_EXT}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: packetmanager-${{ matrix.name }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub release
+    needs: [test, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # needed to create the release and push assets
+    steps:
+      - name: Guard tag format
+        shell: bash
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "tag '$GITHUB_REF_NAME' is not a v<semver> tag, refusing to release" >&2
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: packetmanager-*
+          merge-multiple: true
+          path: dist
+
+      - name: Checksums
+        shell: bash
+        working-directory: dist
+        run: sha256sum packetmanager-* > sha256sums.txt
+
+      - name: Create GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # the workflow token, not a production credential
+        run: |
+          set -euo pipefail
+          cd dist
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            # re-running a failed release: clobber the assets, keep the release
+            gh release upload --clobber "$GITHUB_REF_NAME" packetmanager-* sha256sums.txt
+          else
+            gh release create "$GITHUB_REF_NAME" packetmanager-* sha256sums.txt \
+              --title "packetmanager $GITHUB_REF_NAME" \
+              --generate-notes
+          fi

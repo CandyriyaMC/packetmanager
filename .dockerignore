@@ -1,0 +1,13 @@
+# keep the build context small — none of this belongs in the image
+.git
+.github
+node_modules
+dist
+out
+coverage
+data
+.env
+.env.*
+*.log
+Dockerfile
+.dockerignore
