@@ -1,0 +1,332 @@
+#!/usr/bin/env bun
+// pm — operator CLI for the Candyriya PacketManager registry.
+//
+// Talks plain HTTP to the registry service (default http://localhost:8093).
+// No frameworks, no arg-parsing deps — process.argv is sliced by hand below.
+// Types shared with the server are re-established inline instead of imported,
+// since the CLI and the server don't share code yet.
+//
+// exit codes:
+//   0  ok
+//   1  server unreachable / network error / timeout
+//   2  server 5xx or unparseable/unexpected response
+//   3  server 4xx (rejected publish, missing plugin, ...)
+//   4  usage error (bad args, missing $PM_API_KEY, unreadable/unwritable files)
+
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+
+const FETCH_TIMEOUT_MS = 15_000;
+
+// wire shapes mirrored from the registry service (id/name/version summary, detail)
+interface PluginSummary {
+  id: string;
+  name: string;
+  version: string;
+}
+
+// ---------------------------------------------------------------------------
+// tiny argv slicer — supports `--flag value`, `--flag=value`, `-h` / `--help`.
+// anything not recognized is a usage error, not silently ignored.
+// ---------------------------------------------------------------------------
+
+const VALUE_FLAGS = new Set(['--host', '--port', '--base-url', '--out', '--name', '--version']);
+
+interface ParsedArgs {
+  help: boolean;
+  flags: Record<string, string>;
+  positional: string[];
+}
+
+function parseArgs(argv: string[]): ParsedArgs {
+  const flags: Record<string, string> = {};
+  const positional: string[] = [];
+  let help = false;
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+
+    if (arg === '--help' || arg === '-h') {
+      help = true;
+      continue;
+    }
+    if (arg.startsWith('--')) {
+      const eq = arg.indexOf('=');
+      if (eq !== -1) {
+        const key = arg.slice(0, eq);
+        const value = arg.slice(eq + 1);
+        if (!VALUE_FLAGS.has(key)) dieUsage(`unknown flag: ${key}`);
+        flags[key] = value;
+        continue;
+      }
+      if (VALUE_FLAGS.has(arg)) {
+        const value = argv[i + 1];
+        if (value === undefined) dieUsage(`flag ${arg} needs a value`);
+        flags[arg] = value;
+        i++;
+        continue;
+      }
+      dieUsage(`unknown flag: ${arg}`);
+    }
+    positional.push(arg);
+  }
+
+  return { help, flags, positional };
+}
+
+function dieUsage(message: string): never {
+  console.error(`usage error: ${message}`);
+  process.exit(4);
+}
+
+function usageText(): string {
+  return `pm — operator CLI for the Candyriya PacketManager registry
+
+usage:
+  pm <command> [args] [--host H] [--port P] [--base-url URL]
+
+commands:
+  list                          list published plugins (table output)
+  get <id>                      print plugin detail as pretty JSON
+  download <id> [--out <path>]  fetch the .plugin bundle (default: ./plugins/<id>.plugin)
+  publish <id> <wasm-path>      publish a wasm bundle (needs $PM_API_KEY)
+                                [--name N] [--version V] (defaults: name = id, version = 0.1.0)
+  health                        exit 0 if the server answers /health with ok
+  help                          show this help (same as --help)
+
+flags:
+  --host H        registry host (env PM_HOST, default localhost)
+  --port P        registry port (env PM_PORT, default 8093)
+  --base-url URL  full base URL (env PM_BASE_URL; overrides --host/--port)
+
+exit codes:
+  0  ok
+  1  server unreachable / network error / timeout
+  2  server 5xx or unparseable response
+  3  server 4xx (rejected publish, missing plugin, ...)
+  4  usage error (bad args, missing $PM_API_KEY, unreadable files)
+
+env:
+  PM_HOST, PM_PORT, PM_BASE_URL  where the registry lives
+  PM_API_KEY                     API key for publish (x-api-key header)`;
+}
+
+function resolveBaseUrl(flags: Record<string, string>): string {
+  const explicit = flags['--base-url'] ?? process.env.PM_BASE_URL;
+  const raw = explicit ?? `http://${flags['--host'] ?? process.env.PM_HOST ?? 'localhost'}:${flags['--port'] ?? process.env.PM_PORT ?? '8093'}`;
+  // tolerate trailing slashes so path joins below stay clean
+  return raw.replace(/\/+$/, '');
+}
+
+// ---------------------------------------------------------------------------
+// http helpers
+// ---------------------------------------------------------------------------
+
+async function apiFetch(baseUrl: string, path: string, init?: RequestInit): Promise<Response> {
+  try {
+    return await fetch(`${baseUrl}${path}`, {
+      ...init,
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    });
+  } catch (err) {
+    const isTimeout =
+      err instanceof DOMException && (err.name === 'TimeoutError' || err.name === 'AbortError');
+    if (isTimeout) {
+      console.error(`server at ${baseUrl} did not respond within ${FETCH_TIMEOUT_MS}ms`);
+    } else {
+      console.error(`server unreachable at ${baseUrl}`);
+    }
+    process.exit(1);
+  }
+}
+
+// 4xx/5xx funnel: print the server's body verbatim, then exit with the code
+// for that class. everything after this point sees a 2xx response.
+async function failOnBadStatus(res: Response, baseUrl: string, what: string): Promise<void> {
+  if (res.status < 400) return;
+  const body = await res.text().catch(() => '');
+  console.error(`${what} failed: HTTP ${res.status} from server at ${baseUrl}`);
+  if (body) console.error(body);
+  process.exit(res.status >= 500 ? 2 : 3);
+}
+
+async function readJson(res: Response, baseUrl: string, what: string): Promise<unknown> {
+  const text = await res.text();
+  if (text.trim() === '') return undefined; // empty body — caller decides what it means
+  try {
+    return JSON.parse(text);
+  } catch {
+    console.error(`${what} failed: server at ${baseUrl} returned malformed JSON`);
+    process.exit(2);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// subcommands
+// ---------------------------------------------------------------------------
+
+async function cmdHealth(baseUrl: string): Promise<void> {
+  const res = await apiFetch(baseUrl, '/health');
+  if (res.status === 200) {
+    console.log('ok');
+    return;
+  }
+  await failOnBadStatus(res, baseUrl, 'health');
+}
+
+async function cmdList(baseUrl: string): Promise<void> {
+  const res = await apiFetch(baseUrl, '/api/v1/plugins');
+  await failOnBadStatus(res, baseUrl, 'list');
+  const data = await readJson(res, baseUrl, 'list');
+  if (!Array.isArray(data)) {
+    console.error(`list failed: server at ${baseUrl} returned an unexpected response shape`);
+    process.exit(2);
+  }
+  const rows = (data as PluginSummary[]).map((p) => [
+    String(p?.id ?? ''),
+    String(p?.name ?? ''),
+    String(p?.version ?? ''),
+  ]);
+  const header = ['ID', 'NAME', 'VERSION'];
+  const widths = header.map((h, i) =>
+    Math.max(h.length, ...rows.map((r) => r[i].length)),
+  );
+  const fmtRow = (r: string[]) => r.map((cell, i) => cell.padEnd(widths[i])).join('  ').trimEnd();
+  console.log(fmtRow(header));
+  console.log(widths.map((w) => '-'.repeat(w)).join('  '));
+  if (rows.length === 0) {
+    console.log('(no plugins published)');
+    return;
+  }
+  for (const row of rows) console.log(fmtRow(row));
+}
+
+async function cmdGet(baseUrl: string, id: string): Promise<void> {
+  const res = await apiFetch(baseUrl, `/api/v1/plugins/${encodeURIComponent(id)}`);
+  await failOnBadStatus(res, baseUrl, `get ${id}`);
+  const data = await readJson(res, baseUrl, `get ${id}`);
+  if (data === undefined || data === null) {
+    // registry currently answers an unknown id with 200 + an empty body
+    console.error(`get failed: plugin not found: ${id}`);
+    process.exit(3);
+  }
+  console.log(JSON.stringify(data, null, 2));
+}
+
+async function cmdDownload(baseUrl: string, id: string, outFlag: string | undefined): Promise<void> {
+  const out = outFlag ?? join('plugins', `${id}.plugin`);
+  const res = await apiFetch(baseUrl, `/api/v1/plugins/${encodeURIComponent(id)}/download`);
+  await failOnBadStatus(res, baseUrl, `download ${id}`);
+  const bytes = new Uint8Array(await res.arrayBuffer());
+  await mkdir(dirname(out), { recursive: true });
+  await writeFile(out, bytes);
+  console.log(`downloaded ${id} -> ${out} (${bytes.byteLength} bytes)`);
+}
+
+async function cmdPublish(
+  baseUrl: string,
+  id: string,
+  wasmPath: string,
+  flags: Record<string, string>,
+): Promise<void> {
+  const apiKey = process.env.PM_API_KEY;
+  if (!apiKey) {
+    // fail before hitting the network — no point burning a round trip either way
+    console.error('publish failed: $PM_API_KEY is not set (it authorizes the publish endpoint)');
+    process.exit(4);
+  }
+
+  let bytes: Buffer;
+  try {
+    bytes = await readFile(wasmPath);
+  } catch {
+    console.error(`publish failed: cannot read wasm file: ${wasmPath}`);
+    process.exit(4);
+  }
+
+  const body = {
+    id,
+    name: flags['--name'] ?? id,
+    version: flags['--version'] ?? '0.1.0',
+    module: bytes.toString('base64'),
+  };
+
+  const res = await apiFetch(baseUrl, '/api/v1/plugins/publish', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': apiKey,
+    },
+    body: JSON.stringify(body),
+  });
+  await failOnBadStatus(res, baseUrl, `publish ${id}`);
+
+  const data = await readJson(res, baseUrl, `publish ${id}`);
+  const plugin = (data as { plugin?: { id?: string; version?: string } } | undefined)?.plugin;
+  if (plugin?.id && plugin?.version) {
+    console.log(`published ${plugin.id} ${plugin.version}`);
+    return;
+  }
+  if (data === undefined) {
+    console.log(`publish accepted (server at ${baseUrl} returned an empty response)`);
+    return;
+  }
+  // server said ok but the payload shape wasn't what we know — show it raw
+  console.log(JSON.stringify(data, null, 2));
+}
+
+// ---------------------------------------------------------------------------
+// dispatch
+// ---------------------------------------------------------------------------
+
+async function main(): Promise<void> {
+  const { help, flags, positional } = parseArgs(process.argv.slice(2));
+  if (help) {
+    console.log(usageText());
+    return;
+  }
+
+  const [cmd, ...rest] = positional;
+  const baseUrl = resolveBaseUrl(flags);
+
+  switch (cmd) {
+    case undefined:
+      console.error(usageText());
+      process.exit(4);
+      break;
+    case 'help':
+      console.log(usageText());
+      break;
+    case 'health':
+      await cmdHealth(baseUrl);
+      break;
+    case 'list':
+      await cmdList(baseUrl);
+      break;
+    case 'get':
+      if (!rest[0]) dieUsage('get needs a plugin id: pm get <id>');
+      await cmdGet(baseUrl, rest[0]);
+      break;
+    case 'download':
+      if (!rest[0]) dieUsage('download needs a plugin id: pm download <id> [--out <path>]');
+      await cmdDownload(baseUrl, rest[0], flags['--out']);
+      break;
+    case 'publish':
+      if (!rest[0] || !rest[1]) {
+        dieUsage('publish needs a plugin id and a wasm path: pm publish <id> <wasm-path>');
+      }
+      await cmdPublish(baseUrl, rest[0], rest[1], flags);
+      break;
+    default:
+      console.error(`unknown command: ${cmd}\n`);
+      console.error(usageText());
+      process.exit(4);
+  }
+}
+
+try {
+  await main();
+} catch (err) {
+  console.error(`pm: ${err instanceof Error ? err.message : String(err)}`);
+  process.exit(4);
+}
