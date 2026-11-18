@@ -1,5 +1,5 @@
 import { readFile } from 'node:fs/promises';
-import { Elysia } from 'elysia';
+import { Elysia, t } from 'elysia';
 import { authGuard } from './auth';
 import { PluginRegistry } from './registry';
 
@@ -32,12 +32,12 @@ export function createServer(cfg: ServerConfig) {
         return { ok: true, plugin: { id: body.id, version: body.version } };
       },
       {
-        body: {
-          id: 'string',
-          name: 'string',
-          version: 'string',
-          module: 'string',
-        },
+        body: t.Object({
+          id: t.String(),
+          name: t.String(),
+          version: t.String(),
+          module: t.String(),
+        }),
       },
     )
     .get('/api/v1/plugins/:id/download', async ({ params }) => {
