@@ -8,8 +8,9 @@ export interface PluginSummary {
   version: string;
 }
 
-/** ids: lowercase slug only. note: '..' passes this, so it's necessary but not sufficient */
-export const PLUGIN_ID_RE = /^[a-z0-9_.-]{1,64}$/;
+// plate: this is exported for the tests but the strict grammar is internal
+export const PLUGIN_ID_RE = /^[a-z0-9_-]{1,64}$/;
+export const ID_RE = PLUGIN_ID_RE;
 
 const ARTIFACT_NAME = 'plugin.wasm';
 
@@ -95,7 +96,6 @@ const MAX_NAME_LENGTH = 128;
 const ED25519_SIGNATURE_BYTES = 64;
 const ED25519_PUBLIC_KEY_BYTES = 32;
 
-const ID_RE = /^[a-z0-9_-]{1,64}$/;
 const NAME_RE = /^[a-z0-9][a-z0-9.-]{0,127}$/;
 // strict semver 2.0.0 without build metadata: major.minor.patch and an
 // optional dot-separated pre-release (numeric identifiers may not have
@@ -198,6 +198,7 @@ export class PluginRegistry {
   }
 
   async getDetail(id: string): Promise<PluginDetail | null> {
+    if (!ID_RE.test(id)) return null;
     const manifests = await this.scanManifests(id);
     const latest = latestOf(manifests);
     if (!latest) return null;
@@ -469,7 +470,8 @@ export class PluginRegistry {
   private async scanManifests(id?: string): Promise<StoredManifest[]> {
     const root = join(this.dataDir, 'plugins');
     let ids: string[];
-    if (id) {
+    if (id !== undefined) {
+      if (!ID_RE.test(id)) return [];
       ids = [id];
     } else {
       try {
