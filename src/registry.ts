@@ -1,11 +1,54 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { mkdir, open, readFile, readdir, stat, writeFile } from 'node:fs/promises';
+import { isAbsolute, join, relative, resolve } from 'node:path';
 
 export interface PluginSummary {
   id: string;
   name: string;
   version: string;
+}
+
+/** ids: lowercase slug only. note: '..' passes this, so it's necessary but not sufficient */
+export const PLUGIN_ID_RE = /^[a-z0-9_.-]{1,64}$/;
+
+const ARTIFACT_NAME = 'plugin.wasm';
+
+/**
+ * Resolve the artifact path for a plugin id. The regex gate alone is not a
+ * path-traversal fix ('..' is all dots), so we resolve to an absolute path
+ * and verify it stays inside dataDir. Returns null when the id is invalid
+ * or the resolved path escapes the root.
+ */
+export function resolveArtifactPath(dataDir: string, id: string): string | null {
+  if (!PLUGIN_ID_RE.test(id)) return null;
+  const root = resolve(dataDir);
+  const artifact = resolve(root, id, ARTIFACT_NAME);
+  const rel = relative(root, artifact);
+  if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) return null;
+  return artifact;
+}
+
+// only these are allowed from a manifest; anything else falls through to sniffing
+const ALLOWED_CONTENT_TYPES = new Set(['application/wasm', 'application/octet-stream']);
+
+export interface ResolvedArtifact {
+  path: string;
+  sizeBytes: number;
+  contentType: string;
+}
+
+/** sniff the 4-byte wasm magic \0asm, else octet-stream */
+async function sniffContentType(filePath: string): Promise<string> {
+  const handle = await open(filePath, 'r');
+  try {
+    const head = Buffer.alloc(4);
+    const { bytesRead } = await handle.read(head, 0, 4, 0);
+    const isWasm =
+      bytesRead === 4 && head[0] === 0x00 && head[1] === 0x61 && head[2] === 0x73 && head[3] === 0x6d;
+    return isWasm ? 'application/wasm' : 'application/octet-stream';
+  } finally {
+    await handle.close();
+  }
 }
 
 export interface PluginDetail extends PluginSummary {
@@ -47,11 +90,47 @@ export class PluginRegistry {
     return detail ? { id: detail.id, name: detail.name, version: detail.version } : null;
   }
 
-  /** Read the raw .wasm bytes of a published plugin. */
-  async readManifest(id: string): Promise<Buffer | null> {
+  /**
+   * Locate and classify the plugin artifact. Returns null when the plugin is
+   * missing (invalid id, escaping path, or absent file) — caller maps that to
+   * 404. Content-Type comes from the manifest when it declares an allowlisted
+   * value, otherwise from magic bytes.
+   */
+  async resolveArtifact(id: string): Promise<ResolvedArtifact | null> {
+    const artifactPath = resolveArtifactPath(this.dataDir, id);
+    if (!artifactPath) return null;
+    let sizeBytes: number;
     try {
-      return await readFile(this.manifestPath(id));
-    } catch {
+      const st = await stat(artifactPath);
+      if (!st.isFile()) return null;
+      sizeBytes = st.size;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT' || code === 'ENOTDIR') return null;
+      throw err; // real IO error — caller turns this into a 500
+    }
+    // id is validated at this point, so logging it raw is safe
+    const fromManifest = await this.manifestContentType(id);
+    const contentType = fromManifest ?? (await sniffContentType(artifactPath));
+    return { path: artifactPath, sizeBytes, contentType };
+  }
+
+  /** contentType from manifest.json if it is a string on the allowlist */
+  private async manifestContentType(id: string): Promise<string | null> {
+    try {
+      const raw = await readFile(join(this.dataDir, id, 'manifest.json'), 'utf8');
+      const parsed: unknown = JSON.parse(raw);
+      const ct = (parsed as Record<string, unknown> | null)?.contentType;
+      if (typeof ct === 'string') {
+        const lower = ct.toLowerCase();
+        if (ALLOWED_CONTENT_TYPES.has(lower)) return lower;
+      }
+      return null;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT') {
+        console.warn(`download: ignoring unreadable manifest for plugin id=${id}:`, err);
+      }
       return null;
     }
   }
