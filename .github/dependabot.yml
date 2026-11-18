@@ -1,0 +1,17 @@
+# weekly dependency bumps.
+# bun ecosystem updates package.json + bun.lock as one pair (requires the text
+# bun.lock, which this repo has — bun.lock is supported since bun 1.1.39).
+# github-actions keeps the SHA-pinned actions in .github/workflows fresh,
+# including the version comment next to each SHA.
+# deliberately no "cargo" ecosystem — bun project, nothing to audit there.
+version: 2
+updates:
+  - package-ecosystem: "bun"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
